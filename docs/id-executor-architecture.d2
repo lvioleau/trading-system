@@ -1,0 +1,101 @@
+# ID Executor — component & channel architecture
+#
+# Render:  d2 docs/id-executor-architecture.d2 docs/id-executor-architecture.svg
+#
+# Legend:
+#   solid arrow   = tokio mpsc channel (label: channel name / message type)
+#   dashed arrow  = gRPC stream / call to an external service
+#   dotted arrow  = shared in-memory store handle (async writer -> sync reader)
+
+direction: right
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+# ----------------------------------------------------------------------------
+# External services (gRPC)
+# ----------------------------------------------------------------------------
+externals: External services {
+  style.stroke-dash: 3
+  position_svc: Position Service {shape: cylinder}
+  contract_svc: Contract Service {shape: cylinder}
+  gateway_svc: PowerBot Gateway {shape: cylinder}
+  connector: "Nordpool Connector\n(depth feed)" {shape: cylinder}
+}
+
+# ----------------------------------------------------------------------------
+# Async managers — the stream layer + lifecycle owners (tokio tasks)
+# ----------------------------------------------------------------------------
+async: "Async managers (tokio)" {
+  position_manager: position_manager
+  contract_manager: contract_manager
+  gateway: "gateway::run_subscriptions"
+  fill_matcher: FillMatcher
+  depth_feed: depth_feed
+
+  order_manager: order_manager {
+    order_sender: "OrderSender\n(AddOrder write path)"
+  }
+
+  # Shared in-memory stores (written by a manager, read by the sync loop)
+  position_store: PositionStore {shape: page; style.fill: "#eef6ff"}
+  contract_store: ContractStore {shape: page; style.fill: "#eef6ff"}
+}
+
+# ----------------------------------------------------------------------------
+# Synchronous decision loop (dedicated blocking thread)
+# ----------------------------------------------------------------------------
+sync: "Sync eval loop (blocking thread)" {
+  style.fill: "#fff7ed"
+  eval_loop: "eval_loop\n(evaluate → Decision)" {
+    broker: "Broker\n(OrderBroker)"
+    order_states: "OrderStates\n(OrderTracker)"
+    book_source: "DepthBooks\n(BookSource)"
+  }
+}
+
+# ============================================================================
+# External gRPC edges (dashed)
+# ============================================================================
+externals.position_svc -> async.position_manager: "Subscribe\npositions" {style.stroke-dash: 3}
+externals.contract_svc -> async.contract_manager: "Subscribe\ncontracts" {style.stroke-dash: 3}
+externals.connector -> async.depth_feed: "Subscribe\ndepth" {style.stroke-dash: 3}
+externals.gateway_svc -> async.gateway: "own-orders +\nown-trades" {style.stroke-dash: 3}
+async.order_manager.order_sender -> externals.gateway_svc: "AddOrder\n(IOC)" {style.stroke-dash: 3}
+
+# ============================================================================
+# mpsc channels between components (solid, labeled name / payload)
+# ============================================================================
+
+# Gateway feeds fan out to two owners
+async.gateway -> async.fill_matcher: "fills\n(Fill)"
+async.gateway -> async.order_manager: "gateway_events\n(GatewayEvent / OrderRevision)"
+
+# Position folds feed the matcher
+async.position_manager -> async.fill_matcher: "position_folds\n(PositionFold)"
+
+# Matched fills reach the order manager
+async.fill_matcher -> async.order_manager: "matched_fills\n(MatchedFill)"
+
+# Order sender's advisory responses back to the manager
+async.order_manager.order_sender -> async.order_manager: "responses\n(OrderResponse)"
+
+# Order requests: sync loop -> order manager
+sync.eval_loop.broker -> async.order_manager: "order_requests\n(OrderIntent) — submit()"
+
+# Resolutions: order manager -> sync loop's order-state view
+async.order_manager -> sync.eval_loop.order_states: "resolutions\n(OrderResolved)"
+
+# Depth books: depth feed -> sync loop trigger
+async.depth_feed -> sync.eval_loop.book_source: "books\n(Book) — the sole trigger"
+
+# ============================================================================
+# Shared store handles (dotted, async writer -> sync reader)
+# ============================================================================
+async.position_manager -> async.position_store: "fold" {style.stroke-dash: 2}
+async.contract_manager -> async.contract_store: "upsert" {style.stroke-dash: 2}
+async.position_store -> sync.eval_loop: "position()\n(PositionSource)" {style.stroke-dash: 2}
+async.contract_store -> sync.eval_loop: "tradeability()\n(ContractSource)" {style.stroke-dash: 2}

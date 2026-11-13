@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package flow.v1;
+
+// Shared identity types for the flow.v1 services: the Contract Service (system of
+// record for contract reference data) and the Position Service (whose ledger carries the
+// contract identity verbatim).
+
+// The Nord Pool market segment. Part of a contract's natural identity: contract ids are
+// stable per venue but not assumed unique across the Local and Xbid segments.
+enum MarketType {
+  MARKET_TYPE_NONE = 0;
+  MARKET_TYPE_LOCAL = 1;
+  MARKET_TYPE_XBID = 2;
+}

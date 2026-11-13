@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package flow.v1;
+
+import "flow/v1/types.proto";
+
+// The Position Service is the system of record for portfolio positions on the continuous
+// intraday (ID) market. It keeps an append-only priced trade ledger — transfers between
+// configured portfolios, plus market fills folded from the order gateways' execution
+// streams — whose fold is the in-memory position projection serving every read.
+//
+// A portfolio is a plain configured string (e.g. "execution-a"): the ledger's aggregation
+// boundary and the unit of subscription. A position is a pure signed quantity per
+// (portfolio, contract) — the service tracks no cost or P&L (each ledger trade records its
+// price, so P&L is reconstructable downstream from the priced log).
+//
+// Quantities and prices are integers in the venue's native units, matching the Nord Pool
+// wire encoding: quantities in kW (a 1 MW position is 1000 on the wire), unit prices in
+// market currency minor units per MWh (EUR cents today). Exact by construction — the
+// ledger stores them as exact decimals via a pure scale shift, never floats.
+service PositionService {
+  // Move quantity between two configured portfolios: two zero-sum ledger legs (-quantity on
+  // from, +quantity on to), applied atomically and idempotently by transfer_id — a replay acks
+  // with the current positions, unchanged. Transfers conserve total position by
+  // construction; position enters the system only via market fills.
+  //
+  // A transfer whose quantity was derived from a prior read (reconciling a portfolio
+  // toward a target) should orient that portfolio as from — the signed quantity makes that
+  // always possible — and carry the expected_from_revision guard; ABORTED means the
+  // position moved since that read — re-read, recompute, retry. Purely additive transfers
+  // commute and need no guard.
+  rpc Transfer(TransferRequest) returns (TransferResponse);
+  // Positions of one portfolio: a snapshot as the first message, then the positions each
+  // mutation changed, as they change. Every Position on the stream — seed or delta — is
+  // the same thing: the full value one trade's fold produced, carrying that trade's write
+  // attribution (the venue_trade_id / transfer_id / source that caused it). The snapshot
+  // replays each pair's entire history of them, oldest first (complete: these are
+  // intraday contracts, so a pair stops accruing when its contract expires), making a
+  // (re-)subscribe indistinguishable from having been subscribed since the pair's first
+  // trade — a consumer retires any trade it was still awaiting directly from the seed.
+  // There are no deltas to fold: the client replaces its copy, keeping the highest
+  // revision, which lands the seed's replay on the current value and dedupes the
+  // snapshot/stream overlap. A subscriber that falls behind is dropped with
+  // RESOURCE_EXHAUSTED and reconnects to re-seed. An unknown portfolio is not an error:
+  // it seeds empty and never updates.
+  rpc Subscribe(SubscribeRequest) returns (stream PositionUpdate);
+}
+
+message TransferRequest {
+  // Idempotency key (UUID, canonical string form). The two leg ids derive from it
+  // deterministically, so the same transfer submitted twice folds once.
+  string transfer_id = 1;
+  string from_portfolio = 2;
+  string to_portfolio = 3;
+  // The contract's natural identity — both fields are required.
+  MarketType market_type = 4;
+  int64 contract_id = 5;
+  // Quantity in kW (1 MW = 1000 kW), signed, non-zero: to receives quantity, from receives
+  // -quantity. A negative quantity reverses the flow, which lets a caller keep its read-derived
+  // portfolio on the from side (where the concurrency guard lives) whichever way the
+  // delta points.
+  int64 quantity = 6;
+  // Unit price, in market currency minor units per MWh (EUR cents today) — the venue's
+  // own encoding; negative prices are legitimate. Recorded on both legs, not folded —
+  // positions are pure quantities.
+  int64 price = 7;
+  // Submitting component (crosser id, ...), recorded on both legs.
+  string source = 8;
+  // When the cross decided (unix nanos).
+  int64 executed_at_nanos = 9;
+  // Optional optimistic-concurrency guard on the from side — by convention the portfolio
+  // the caller's quantity was derived from. When set, the transfer applies only while
+  // (from_portfolio, contract)'s revision still equals this value (0 = the position does
+  // not exist yet). Absent means unguarded — right for fixed-size additive transfers,
+  // which commute.
+  optional uint64 expected_from_revision = 10;
+}
+
+message TransferResponse {
+  // The full resulting positions of the two legs — or the current positions, unchanged,
+  // when transfer_id was already applied (idempotent replay).
+  Position from_position = 1;
+  Position to_position = 2;
+}
+
+message SubscribeRequest {
+  // Selects the portfolio whose positions are streamed.
+  string portfolio = 1;
+}
+
+// A batch of position updates: the snapshot on subscribe (each pair's attributed history,
+// oldest first — possibly none), then the positions one mutation changed, trimmed to the
+// subscribed portfolio. Every entry carries the attribution of the trade that produced it.
+message PositionUpdate {
+  repeated Position positions = 1;
+}
+
+// The full value of one (portfolio, contract) position as one trade's fold produced it —
+// current on a streamed change; on the snapshot, one entry per fold in the pair's history
+// (the last is current, and clients keep the highest revision anyway).
+message Position {
+  string portfolio = 1;
+  MarketType market_type = 2;
+  int64 contract_id = 3;
+  // Net quantity in kW, signed: long > 0, short < 0 (1 MW = 1000 kW). A position that
+  // nets to zero still exists — going flat is a change subscribers see.
+  int64 net_quantity = 4;
+  // Monotonic per (portfolio, contract), bumped by every applied ledger trade; stable
+  // across service restarts. Clients keep the highest.
+  uint64 revision = 5;
+
+  // Write attribution — the trade whose fold produced this value, set on every streamed
+  // change and every snapshot history entry (the attribution-less exception is the
+  // TransferResponse, which already identifies its transfer). Exactly one of
+  // venue_trade_id / transfer_id is set: a market fill carries venue_trade_id (the
+  // own-trades match key), a transfer leg carries transfer_id (the submitter's key).
+  // Empty string means "not set".
+
+  // The fill's venue trade id; empty for a transfer leg.
+  string venue_trade_id = 6;
+  // The originating transfer id (canonical UUID string); empty for a fill.
+  string transfer_id = 7;
+  // Submitting component (gateway name, crosser id, ...).
+  string source = 8;
+  // When the causing trade executed on the exchange / the cross decided (unix nanos,
+  // matching the gateway wire's exec_time_nanos).
+  int64 executed_at_nanos = 9;
+  // The fill's originating client order id (the nonce the submitter stamped on the order,
+  // threaded from the gateway's Trade.txt) — additional attribution, letting a submitter
+  // recognize a fold as its own order's alongside the venue_trade_id match. Fills only;
+  // empty for a transfer leg.
+  string cl_order_id = 10;
+}

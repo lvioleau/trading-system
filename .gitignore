@@ -1,0 +1,20 @@
+# Build output
+/target
+*.log
+
+# Python
+.venv
+__pycache__/
+*.pyc
+
+# Editors
+.zed
+.vscode
+.direnv
+
+# Env files hold secrets (POWERBOT_API_KEY etc.) — never commit them.
+.env
+*.env
+
+# PowerBot OpenAPI spec (vendor document; download it locally to regenerate models)
+api/openapi.yaml

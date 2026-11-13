@@ -1,0 +1,12 @@
+// Vendored verbatim from the nordpool-connector repo (proto/nordpool/marketdata/v1/
+// types.proto) — that repo is the single owner; do not edit here.
+
+syntax = "proto3";
+
+package nordpool.marketdata.v1;
+
+enum MarketType {
+  MARKET_TYPE_NONE = 0;
+  MARKET_TYPE_LOCAL = 1;
+  MARKET_TYPE_XBID = 2;
+}

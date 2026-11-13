@@ -1,0 +1,30 @@
+[package]
+name = "id-executor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eic = { path = "../eic" }
+anyhow = "1"
+configparser = "3"
+flow-util = { path = "../flow-util" }
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tonic = "0.12"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# The contract feed's mock upstream is served from contract-service's generated server
+# traits (this crate generates client stubs only).
+contract-service = { path = "../contract-service" }
+futures-util = "0.3"
+# The real Position Service server (run memory-only) is the position feed's test upstream.
+position-service = { path = "../position-service" }
+tokio-stream = { version = "0.1", features = ["net"] }
+uuid = "1"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"

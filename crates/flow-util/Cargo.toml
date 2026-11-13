@@ -1,0 +1,9 @@
+[package]
+name = "flow-util"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+configparser = "3"
+tonic = "0.12"

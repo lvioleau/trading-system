@@ -1,0 +1,156 @@
+syntax = "proto3";
+
+package flow.v1;
+
+import "flow/v1/types.proto";
+
+// The Contract Service is the system of record for Nord Pool contract reference data. It syncs
+// the connector's contract feed into a full-history store and serves it two ways: a live
+// seed-then-deltas stream for hot clients, and a unary query answered over the full history —
+// including contracts absent from the current feed (past deliveries, expired contracts,
+// contracts from before the last restart).
+//
+// Contract and its enums mirror nordpool.marketdata.v1 (owned by the nordpool-connector
+// repo); the feed client translates at the boundary.
+service ContractService {
+  // Live set for a delivery area: a seed carrying the full current set, then each change as it
+  // arrives. Every message is a batch of upserts keyed by contract identity (contracts are never
+  // removed, they change state), so a client merges each batch into its own map.
+  rpc SubscribeContracts(SubscribeContractsRequest) returns (stream ContractUpdate);
+  // Full-history query: contracts whose delivery window overlaps [delivery_start_ms, delivery_end_ms).
+  rpc ListContracts(ListContractsRequest) returns (ListContractsResponse);
+  // Full-history query by containment: contracts whose whole delivery window lies between
+  // delivery_from_ms and delivery_to_ms. A caller that knows a window exactly passes
+  // delivery_start/delivery_end as the bounds and finds that window's contracts (plus any
+  // shorter products nested inside — narrow with contract_id, which yields at most one match
+  // per market segment). delivery_area_eics optionally restricts to contracts trading in any
+  // of the listed areas.
+  rpc FindContracts(FindContractsRequest) returns (FindContractsResponse);
+  // One contract's history: its current record plus every recorded lifecycle state
+  // transition, from its first appearance on. Only state is expected to change over a
+  // contract's life; the intrinsic fields are served at their current values (a venue
+  // correction overwrites them in place — the connector's archive keeps the raw frames).
+  // NOT_FOUND for a contract the service has never seen.
+  rpc GetContractHistory(GetContractHistoryRequest) returns (GetContractHistoryResponse);
+}
+
+message SubscribeContractsRequest {
+  // Selects the delivery area whose live set is streamed, as its ENTSO-E EIC code
+  // (e.g. `10YFI-1--------U`).
+  string delivery_area_eic = 1;
+}
+
+// A batch of contract upserts: the full set on the connect/lag seed, or the contracts a single
+// feed frame changed.
+message ContractUpdate {
+  repeated Contract contracts = 1;
+  // Connector receive timestamp (unix nanos) of the frame whose changes this batch carries; 0 on
+  // the connect/lag seed, which is assembled from the current state of many frames.
+  int64 received_at_nanos = 2;
+}
+
+message ListContractsRequest {
+  // Delivery areas to query, as ENTSO-E EIC codes — at least one; a contract matches when it
+  // trades in any of them.
+  repeated string delivery_area_eics = 1;
+  // Overlap semantics: delivery ∩ [delivery_start_ms, delivery_end_ms) ≠ ∅.
+  int64 delivery_start_ms = 2;
+  int64 delivery_end_ms = 3;
+  // Optional: only this contract id (at most one contract per market segment).
+  int64 contract_id = 4;
+}
+
+message ListContractsResponse {
+  repeated Contract contracts = 1;
+}
+
+message FindContractsRequest {
+  // Optional: only contracts trading in at least one of these delivery areas (ENTSO-E EIC
+  // codes); empty matches every area.
+  repeated string delivery_area_eics = 1;
+  // Required containment bounds: delivery_from_ms <= delivery_start and
+  // delivery_end <= delivery_to_ms. Equal bounds are an exact window match.
+  int64 delivery_from_ms = 2;
+  int64 delivery_to_ms = 3;
+  // Optional: only this contract id. Ids are not assumed unique across the Local and Xbid
+  // market segments, so this is at most one contract per segment (each returned Contract
+  // carries its market_type).
+  int64 contract_id = 4;
+  // Optional: only this product type; the unset (NONE) value matches every contract.
+  ProductType product_type = 5;
+}
+
+message FindContractsResponse {
+  repeated Contract contracts = 1;
+}
+
+message GetContractHistoryRequest {
+  // The contract's identity — both fields are required (see Contract).
+  MarketType market_type = 1;
+  int64 contract_id = 2;
+}
+
+message GetContractHistoryResponse {
+  // The contract as served everywhere else: current intrinsics, current state per area.
+  Contract contract = 1;
+  // Every recorded state transition, ascending by venue update time (ties: by area EIC —
+  // one feed frame can flip several areas at once).
+  repeated StateChange state_changes = 2;
+}
+
+// One lifecycle state transition in one delivery area, including the contract's first
+// appearance there. A frame that merely re-stamps an unchanged state records nothing.
+message StateChange {
+  // The delivery area, as its ENTSO-E EIC code.
+  string delivery_area_eic = 1;
+  // The state the area changed *to*.
+  ContractState state = 2;
+  // Venue-side update time of the frame that carried the transition.
+  int64 updated_at_ms = 3;
+  // When this service recorded it (unix ms). History predating the history table (rebuilt or
+  // migrated in) carries the backfill time, not the original observation time.
+  int64 recorded_at_ms = 4;
+}
+
+// A contract is identified by (market_type, contract_id): Nord Pool ids are stable per venue but
+// not assumed unique across the Local and Xbid market segments.
+message Contract {
+  int64 contract_id = 1;
+  string name = 2;
+  string market_id = 3;
+  MarketType market_type = 4;
+  ProductType product_type = 5;
+  int64 delivery_start_ms = 6;
+  int64 delivery_end_ms = 7;
+  int32 duration_seconds = 8;
+  // Venue-side update time — the out-of-order upsert guard.
+  int64 updated_at_ms = 9;
+  // Lifecycle state is per delivery area.
+  repeated ContractDeliveryArea delivery_areas = 10;
+}
+
+message ContractDeliveryArea {
+  // The delivery area, as its ENTSO-E EIC code.
+  string delivery_area_eic = 1;
+  ContractState state = 2;
+}
+
+// MarketType lives in flow/v1/types.proto, shared with the Position Service.
+
+// The 15/30/60-minute periodic products; every other shape (blocks, custom, unspecified) folds
+// into OTHER. NONE is the unset default, distinct from a contract that is OTHER.
+enum ProductType {
+  PRODUCT_TYPE_NONE = 0;
+  PRODUCT_TYPE_P15_MIN = 1;
+  PRODUCT_TYPE_P30_MIN = 2;
+  PRODUCT_TYPE_P60_MIN = 3;
+  PRODUCT_TYPE_OTHER = 4;
+}
+
+enum ContractState {
+  CONTRACT_STATE_NONE = 0;
+  CONTRACT_STATE_ACTIVE = 1;
+  CONTRACT_STATE_HIBERNATED = 2;
+  CONTRACT_STATE_INACTIVE = 3;
+  CONTRACT_STATE_FROZEN = 4;
+}

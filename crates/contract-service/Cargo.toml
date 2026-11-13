@@ -1,0 +1,29 @@
+[package]
+name = "contract-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eic = { path = "../eic" }
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+configparser = "3"
+flow-util = { path = "../flow-util" }
+futures-util = "0.3"
+prost = "0.13"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "migrate", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tonic = "0.12"
+tonic-health = "0.12"
+tonic-reflection = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"

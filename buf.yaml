@@ -1,0 +1,19 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # The streaming feeds return domain-named batches (ContractUpdate, PositionUpdate)
+    # rather than <Method>Response wrappers — the message *is* the entity. The standard
+    # name convention targets unary request/response pairs and adds nothing here.
+    - RPC_RESPONSE_STANDARD_NAME
+  enum_zero_value_suffix: _NONE
+  ignore:
+    # Vendored copies of the nordpool connector's marketdata protos (see proto/). They are
+    # the connector's contract, linted in its own repo.
+    - proto/nordpool
+breaking:
+  use:
+    - FILE

@@ -1,0 +1,32 @@
+[package]
+name = "powerbot-tester"
+version = "0.0.1"
+edition = "2024"
+
+# A ratatui TUI for manually exercising the gateway. It is a gRPC *client* of two
+# servers: the powerbot-gateway (order entry + own-order/own-trade feeds) and the
+# nordpool connector's stream-server (contract reference data + depth feed, used
+# to pick a contract and show its best bid/ask). See README.md ("Tester TUI").
+[[bin]]
+name = "powerbot-tester"
+path = "src/main.rs"
+
+[dependencies]
+eic = { path = "../eic" }
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tonic = "0.12"
+prost = "0.13"
+futures-util = "0.3"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+chrono = { version = "0.4", features = ["clock"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+[build-dependencies]
+tonic-build = "0.12"
+# Fallback protoc for environments without one on PATH (e.g. GitHub CI, which
+# doesn't use the Nix/devenv shell). Locally the devenv shell supplies protoc.
+protoc-bin-vendored = "3"

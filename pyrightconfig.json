@@ -1,0 +1,5 @@
+{
+  "reportMissingTypeStubs": false,
+  "venv": "venv",
+  "venvPath": ".devenv/state"
+}

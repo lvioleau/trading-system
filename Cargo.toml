@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/contract-service",
+    "crates/crosser",
+    "crates/eic",
+    "crates/flow-util",
+    "crates/id-executor",
+    "crates/position-service",
+    "crates/powerbot-gateway",
+    "crates/powerbot-models",
+    "crates/powerbot-tester",
+    "crates/strategy",
+]

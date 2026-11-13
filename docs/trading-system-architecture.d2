@@ -1,0 +1,87 @@
+# Trading System — architecture
+#
+# Render:  d2 docs/trading-system-architecture.d2 docs/trading-system-architecture.svg
+#
+# The strategy-decoupled platform: strategy targets -> execution -> venues, with Nord Pool
+# market data feeding the strategy and the executor through the connector. Read left to right.
+#
+# Legend:
+#   solid arrow   = gRPC stream / call between our own services
+#   dashed arrow  = interface to an external venue / hosted webservice (wss / REST)
+#
+# Colour convention mirrors the overview page's mermaid:
+#   green = strategy · orange = connector/gateway bridges · red = execution workers
+#   blue (cylinder) = system-of-record service · grey (double border) = external venue
+
+direction: right
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+title: "Trading System — architecture" {
+  near: top-center
+  shape: text
+  style: {font-size: 30; bold: true}
+}
+
+classes: {
+  strategy: {style: {fill: "#ecfdf3"; stroke: "#12b76a"}}
+  bridge: {style: {fill: "#fff7ed"; stroke: "#f79009"}}
+  worker: {style: {fill: "#fef3f2"; stroke: "#f04438"}}
+  state: {shape: cylinder; style: {fill: "#eff8ff"; stroke: "#2e90fa"}}
+  venue: {style: {fill: "#f2f4f7"; stroke: "#667085"; double-border: true}}
+}
+
+# ----------------------------------------------------------------------------
+# External venues (dashed edges cross this boundary)
+# ----------------------------------------------------------------------------
+np_id: "Nord Pool ID\nmarket data" {class: venue}
+powerbot: "PowerBot / Volue\nhosted venue interface" {class: venue}
+da_auction: "Day-Ahead auction\n(Nord Pool)" {class: venue}
+balancing: "Balancing platforms\nFCR Coop · RACOON · PICASSO" {class: venue}
+
+# ----------------------------------------------------------------------------
+# Market data + reference / state services
+# ----------------------------------------------------------------------------
+connector: "Nordpool Connector" {class: bridge}
+position_svc: "Position Service" {class: state}
+
+# ----------------------------------------------------------------------------
+# Strategy + execution layers
+# ----------------------------------------------------------------------------
+strategy: "Strategy Layer\n(mock: crates/strategy)" {class: strategy}
+crosser: "Crosser" {class: worker}
+id_exec: "ID Executor" {class: worker}
+gateway: "PowerBot Gateway" {class: bridge}
+auction_exec: "Auction Executors\n(DA · FCR · aFRR)" {class: worker}
+
+# ============================================================================
+# Market data in (dashed = external venue boundary)
+# ============================================================================
+np_id -> connector: "wss" {style.stroke-dash: 3}
+connector -> id_exec: "contracts · depth\nstatistics"
+
+# Strategy re-optimizes against live market data + live positions
+connector -> strategy: "contracts · depth\nstatistics"
+position_svc -> strategy: "positions\n(Subscribe)"
+
+# ============================================================================
+# The continuous intraday (ID) loop
+# ============================================================================
+strategy -> crosser: "target ID positions"
+crosser -> position_svc: "transfers"
+position_svc -> id_exec: "execution gap\n(Subscribe)"
+id_exec -> gateway: "IOC orders\n(AddOrder)"
+gateway -> id_exec: "fills · order state"
+gateway -> position_svc: "own trades:\nseed + deltas"
+gateway <-> powerbot: "orders · executions" {style.stroke-dash: 3}
+
+# ============================================================================
+# The auction / balancing paths
+# ============================================================================
+strategy -> auction_exec: "bidding curves"
+auction_exec -> da_auction: "DA curves · clearings" {style.stroke-dash: 3}
+auction_exec -> balancing: "FCR · aFRR curves · awards" {style.stroke-dash: 3}

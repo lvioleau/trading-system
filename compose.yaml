@@ -1,0 +1,247 @@
+# Dev/test stack: Postgres + every trading-system binary on one compose network, where the
+# services reach each other by service name (contract-service:50054, position-service:50053,
+# powerbot-gateway:50052, strategy:50071) — no host-gateway addressing, identical on the macOS
+# podman machine and on Linux. Run it through scripts/dev-stack.sh, which pins the podman
+# socket before delegating to `podman compose`.
+#
+# Ports are still published to the host for the native tools: grpcurl/grpcui against any
+# service, the powerbot-tester TUI (scripts/run-tester.sh), the psql-in-container dumps, and
+# `cargo test` against Postgres on :5433 (the layout the storage tests expect).
+#
+# The one upstream that is *not* in this stack is the nordpool-connector: it lives in its own
+# repo, with its own compose stack. Everything that subscribes to it (contract-service,
+# strategy, crosser, id-executor) dials CONNECTOR_HOST — host.containers.internal by default,
+# i.e. whatever serves :50051 on the host: the connector stack's published port, a native
+# `cargo run`, or a tunnel. Override CONNECTOR_HOST/CONNECTOR_PORT to point elsewhere.
+#
+# Secrets: POWERBOT_API_KEY is the only one. It comes from the gitignored gateway.shadow.env
+# (override: ENV_FILE) along with the rest of the gateway's POWERBOT_* config — see the
+# powerbot-gateway service below. Nothing else here is secret.
+#
+# Every ${VAR} the config INIs reference but this file does not set resolves to the INI's own
+# ${VAR:-default} inside the container, so the shipped defaults stay in one place (the INI).
+#
+# container_name is pinned on postgres: scripts/dump-positions.sh, dump-execution.sh and
+# drop-execution-schema.sh run psql inside it by that name.
+
+name: trading
+
+# One image carries every binary (the repo Dockerfile; the container command names the one to
+# start). No `build:` here on purpose: six services sharing one tag makes compose run that
+# build once per service and in parallel, and six concurrent cargo builds through one cache
+# mount exhaust the podman machine's memory. scripts/dev-stack.sh builds the image once before
+# delegating — go through it rather than bare `podman compose`, or the image is simply missing.
+#
+# `restart: "no"` is deliberate too: the feeds already reconnect with backoff on their own, so
+# a process that actually exited has a real problem and should stay down and visible.
+x-flow-service: &flow-service
+  # `localhost/` qualifies the tag explicitly: an unqualified name would send podman through
+  # short-name resolution and out to a registry for an image that only exists locally.
+  image: localhost/trading-system:latest
+  restart: "no"
+
+# The shared Postgres — one `trading` database, one schema per service (reference / positions /
+# execution). Inside the network it is always postgres:5432; the host sees :5433.
+x-database-url: &database-url postgres://postgres:postgres@postgres:5432/trading
+
+# Service ports in one place: each service's own listen port and every endpoint dialing it read
+# the same variable here and in the INIs, so a moved port moves both ends at once. Handed to
+# every service (an unread variable is harmless) so this list stays the single source.
+x-ports: &ports
+  CONNECTOR_PORT: ${CONNECTOR_PORT:-50051}
+  GATEWAY_PORT: ${GATEWAY_PORT:-50052}
+  POSITION_SERVICE_PORT: ${POSITION_SERVICE_PORT:-50053}
+  CONTRACT_SERVICE_PORT: ${CONTRACT_SERVICE_PORT:-50054}
+  STRATEGY_PORT: ${STRATEGY_PORT:-50071}
+  CROSSER_PORT: ${CROSSER_PORT:-50072}
+  ID_EXECUTOR_PORT: ${ID_EXECUTOR_PORT:-50073}
+  RUST_LOG: ${RUST_LOG:-info}
+
+services:
+  postgres:
+    image: docker.io/library/postgres:17
+    container_name: trading-postgres
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    environment:
+      # Local-only credentials; the prod database is separate and injected per deployment.
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: trading
+    volumes:
+      # Named volume, so the trade ledger and the execution record survive a `down` — the
+      # position-service boot-fold then has history to replay. `down -v` wipes it.
+      - postgres-data:/var/lib/postgresql/data
+    # The services migrate at boot, so they must not start before the server accepts
+    # connections; every dependent waits on this check.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username postgres --dbname trading --quiet"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  contract-service:
+    !!merge <<: *flow-service
+    container_name: contract-service
+    command: contract-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${CONTRACT_SERVICE_PORT:-50054}:${CONTRACT_SERVICE_PORT:-50054}"
+    environment:
+      !!merge <<: *ports
+      CONNECTOR_HOST: ${CONNECTOR_HOST:-host.containers.internal}
+      DELIVERY_AREA_EICS: ${DELIVERY_AREA_EIC:-10YFR-RTE------C}
+      DATABASE_URL: *database-url
+
+  position-service:
+    !!merge <<: *flow-service
+    container_name: position-service
+    command: position-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # The gateway feed reconnects on its own, so this only orders the boot logs.
+      powerbot-gateway:
+        condition: service_started
+    ports:
+      - "${POSITION_SERVICE_PORT:-50053}:${POSITION_SERVICE_PORT:-50053}"
+    environment:
+      !!merge <<: *ports
+      # The ledger's aggregation boundaries: the strategy portfolio the crosser transfers out
+      # of, and the execution portfolio it transfers into. The *mapping* between them is
+      # hardcoded in crosser.ini ([crosser.portfolio.<name>]) and in position-service.ini
+      # ([position-service.gateway.nordpool-a]) — overriding these two variables alone is not
+      # enough, those sections have to move with them.
+      PORTFOLIOS: "${STRATEGY_PORTFOLIO:-strat-batt-1}, ${EXECUTION_PORTFOLIO:-exec-1}"
+      GATEWAYS: ${GATEWAYS:-nordpool-a}
+      GATEWAY_NORDPOOL_A_HOST: powerbot-gateway
+      DATABASE_URL: *database-url
+
+  powerbot-gateway:
+    !!merge <<: *flow-service
+    container_name: powerbot-gateway
+    command: powerbot-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${GATEWAY_PORT:-50052}:${GATEWAY_PORT:-50052}"
+    # The gateway's POWERBOT_* config file — the repo's existing convention (gitignored; it is
+    # where the API key lives). Optional: without it the defaults below stand. It carries keys
+    # this file does not model (POWERBOT_WS_URL, POWERBOT_REST_URL, POWERBOT_METRICS_TAGS…)
+    # straight through to the container. For the keys that *are* modelled below, note that an
+    # `environment:` entry always wins over env_file — which is why dev-stack.sh exports the
+    # file's values before compose runs, so the interpolation resolves to them rather than
+    # silently blanking them.
+    env_file:
+      - path: ${ENV_FILE:-gateway.shadow.env}
+        required: false
+    environment:
+      !!merge <<: *ports
+      # powerbot.ini defaults the bind to 127.0.0.1 (the native-run default); in a container
+      # that is unreachable through the published port.
+      POWERBOT_GRPC_HOST: 0.0.0.0
+      POWERBOT_DATABASE_URL: *database-url
+      # The one secret in the stack: from the shell, the gateway env file above, or the
+      # repo-root .env. Empty rather than required, so `up postgres` (the `cargo test`
+      # database) works without a key — dev-stack.sh warns when it is missing.
+      POWERBOT_API_KEY: ${POWERBOT_API_KEY:-}
+      # Each of these takes the gateway's own POWERBOT_* variable when set (shell or env file),
+      # else the stack-wide variable that also drives the other services, else the default.
+      # That ordering is what keeps one delivery area across the stack — the gateway must serve
+      # the area the executor sends orders for and the connector feeds — while still letting
+      # the gateway env file override it on its own.
+      POWERBOT_PORTFOLIO_ID: ${POWERBOT_PORTFOLIO_ID:-${EXECUTION_PORTFOLIO:-exec-1}}
+      POWERBOT_DELIVERY_AREA: ${POWERBOT_DELIVERY_AREA:-${DELIVERY_AREA_EIC:-10YFR-RTE------C}}
+      POWERBOT_EXCHANGE: ${POWERBOT_EXCHANGE:-${EXCHANGE:-nordpool}}
+      # The dev deployment points at the PowerBot *shadow* instance (powerbot.ini's wss/rest
+      # defaults); a gateway aimed at the live instance must set POWERBOT_SHADOW=false.
+      POWERBOT_SHADOW: ${POWERBOT_SHADOW:-true}
+      # DogStatsD is UDP: with no agent listening the packets drop silently, so this is safe
+      # unset. A host-side agent (the connector stack publishes one on 8125) picks them up.
+      POWERBOT_DOGSTATSD_ADDR: ${POWERBOT_DOGSTATSD_ADDR:-host.containers.internal:8125}
+
+  strategy:
+    !!merge <<: *flow-service
+    container_name: strategy
+    command: strategy
+    depends_on:
+      contract-service:
+        condition: service_started
+      position-service:
+        condition: service_started
+    ports:
+      - "${STRATEGY_PORT:-50071}:${STRATEGY_PORT:-50071}"
+    environment:
+      !!merge <<: *ports
+      CONTRACT_SERVICE_HOST: contract-service
+      POSITION_SERVICE_HOST: position-service
+      CONNECTOR_HOST: ${CONNECTOR_HOST:-host.containers.internal}
+      STRATEGY: ${STRATEGY:-strategy-x}
+      # Exactly one portfolio per strategy process, by design.
+      PORTFOLIO: ${STRATEGY_PORTFOLIO:-strat-batt-1}
+      DELIVERY_AREA_EIC: ${DELIVERY_AREA_EIC:-10YFR-RTE------C}
+      # The mock's two knobs, mirroring strategy.ini's defaults so they are tunable per run.
+      CONTRACTS: ${CONTRACTS:-20}
+      AMPLITUDE: ${AMPLITUDE:-10000}
+      # The Python module the cradle runs is the one baked into the image at strategy.ini's
+      # default path; STRATEGY_PYTHON names another (in-container) path.
+      STRATEGY_PYTHON: ${STRATEGY_PYTHON:-crates/strategy/py/strategy.py}
+
+  crosser:
+    !!merge <<: *flow-service
+    container_name: crosser
+    command: crosser
+    depends_on:
+      strategy:
+        condition: service_started
+      position-service:
+        condition: service_started
+    ports:
+      - "${CROSSER_PORT:-50072}:${CROSSER_PORT:-50072}"
+    environment:
+      !!merge <<: *ports
+      STRATEGY_HOST: strategy
+      POSITION_SERVICE_HOST: position-service
+      CONNECTOR_HOST: ${CONNECTOR_HOST:-host.containers.internal}
+      # Must name the strategy above: the subscription is rejected — fatal at boot — if that
+      # strategy does not produce every portfolio here.
+      STRATEGY: ${STRATEGY:-strategy-x}
+      CROSSER_PORTFOLIOS: ${STRATEGY_PORTFOLIO:-strat-batt-1}
+      DELIVERY_AREA_EIC: ${DELIVERY_AREA_EIC:-10YFR-RTE------C}
+
+  id-executor:
+    !!merge <<: *flow-service
+    container_name: id-executor
+    command: id-executor
+    depends_on:
+      position-service:
+        condition: service_started
+      contract-service:
+        condition: service_started
+      powerbot-gateway:
+        condition: service_started
+    ports:
+      - "${ID_EXECUTOR_PORT:-50073}:${ID_EXECUTOR_PORT:-50073}"
+    environment:
+      !!merge <<: *ports
+      POSITION_SERVICE_HOST: position-service
+      CONTRACT_SERVICE_HOST: contract-service
+      GATEWAY_HOST: powerbot-gateway
+      CONNECTOR_HOST: ${CONNECTOR_HOST:-host.containers.internal}
+      EXCHANGE: ${EXCHANGE:-nordpool}
+      DELIVERY_AREA_EIC: ${DELIVERY_AREA_EIC:-10YFR-RTE------C}
+      # The execution portfolios this executor owns — the same ids the gateway serves and the
+      # crosser transfers into.
+      ID_EXECUTOR_PORTFOLIOS: ${EXECUTION_PORTFOLIO:-exec-1}
+      # The per-run log-file mirror, on a volume so it outlives the container. /logs is created
+      # in the Dockerfile owned by appuser, so the named volume inherits that ownership.
+      ID_EXECUTOR_LOG_DIR: /logs
+    volumes:
+      - executor-logs:/logs
+
+volumes:
+  postgres-data:
+  executor-logs:

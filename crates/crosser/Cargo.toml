@@ -1,0 +1,28 @@
+[package]
+name = "crosser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eic = { path = "../eic" }
+anyhow = "1"
+configparser = "3"
+flow-util = { path = "../flow-util" }
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tonic = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+# The real Position Service server (run memory-only) is the crossing loop's test downstream.
+position-service = { path = "../position-service" }
+# The mock strategy is the reference StrategyService server and this crate's test double.
+strategy = { path = "../strategy" }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"

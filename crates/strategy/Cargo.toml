@@ -1,0 +1,29 @@
+[package]
+name = "strategy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eic = { path = "../eic" }
+anyhow = "1"
+configparser = "3"
+flow-util = { path = "../flow-util" }
+futures-util = "0.3"
+prost = "0.13"
+# The strategy proper is a Python module behind src/py_strategy.rs — the embedded interpreter
+# (auto-initialize) links libpython, which the devenv shell and the Docker builder provide.
+pyo3 = { version = "0.29.0", features = ["auto-initialize"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tonic = "0.12"
+tonic-health = "0.12"
+tonic-reflection = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"

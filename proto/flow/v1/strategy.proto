@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package flow.v1;
+
+import "flow/v1/types.proto";
+
+// The Strategy Service is the Strategy Layer's target-position feed for the Crosser on the
+// continuous intraday (ID) market. It streams the strategy's own trade log — one
+// target-position record per (portfolio, contract) as the strategy re-optimizes. The crosser
+// reconciles the actual Position Service position to each record's target_quantity; the rest of
+// the record is the strategy's booking, carried for the crosser's logs and the execution
+// backtest. See docs/crosser-implementation.md.
+//
+// This proto is defined in this repo for now (the crosser's contract) and served by the mock in
+// crates/strategy; it moves to the strategy repo, vendored back, when that repo lands.
+service StrategyService {
+  // The strategy's stream of target-position records for the requested portfolios. The
+  // subscription is scoped to `portfolios`: the server rejects it (INVALID_ARGUMENT) if it does
+  // not produce every requested portfolio, and streams only those portfolios. No seed, no
+  // snapshot — the stream is continuous and each record is self-contained. The strategy re-emits
+  // each contract's current target periodically as a heartbeat (delta_quantity = 0 when
+  // unchanged), bounding staleness after a reconnect and giving the crosser a standing
+  // reconciliation pulse.
+  rpc SubscribeTargets(SubscribeTargetsRequest) returns (stream TargetRecord);
+}
+
+message SubscribeTargetsRequest {
+  // Which strategy to stream from. One strategy per crosser.
+  string strategy = 1;
+  // The strategy portfolios to stream — exactly the crosser's configured portfolios. The server
+  // rejects the subscription (INVALID_ARGUMENT) if any is a portfolio it does not produce, so a
+  // misconfigured crosser fails fast at boot instead of silently receiving nothing. At least one.
+  repeated string portfolios = 2;
+}
+
+// One target-position record: the strategy's booking of a trade on one (portfolio, contract).
+message TargetRecord {
+  // The strategy portfolio this target is for; the crosser maps it to an execution portfolio.
+  string portfolio = 1;
+  MarketType market_type = 2;
+  int64 contract_id = 3;
+  // Absolute target net quantity in kW, signed (long > 0, short < 0). The only field the crosser
+  // acts on — it crosses whatever reaches this from the actual position.
+  int64 target_quantity = 4;
+  // The strategy's own booking of this trade — its view of the position before (current), the
+  // change it intends (delta = target - current), and the mid it valued the trade at. In
+  // production the crosser does not size the cross from current/delta nor price from mid_price
+  // (it uses the actual position and the live depth mid); the execution backtest replays the
+  // (target, mid) stream, so mid_price is the backtest's baseline.
+  int64 current_quantity = 5;
+  int64 delta_quantity = 6;
+  // Market currency minor units per MWh; negative mids are legitimate.
+  int64 mid_price = 7;
+}

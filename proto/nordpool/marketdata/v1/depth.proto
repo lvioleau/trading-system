@@ -1,0 +1,65 @@
+// Vendored verbatim from the nordpool-connector repo (proto/nordpool/marketdata/v1/
+// depth.proto) — that repo is the single owner; do not edit here.
+
+syntax = "proto3";
+
+package nordpool.marketdata.v1;
+
+import "nordpool/marketdata/v1/types.proto";
+
+// Streams depth views (the top N price levels per side) for reconstructed local order books. On
+// connect a client receives a seed: one DepthUpdate carrying the current view of every subscribed
+// book. After that, each inbound frame's changed books are sent together as one DepthUpdate. Each
+// DepthView is full top-N state for one book (not a delta); a batch groups the books that changed
+// in the same frame.
+service DepthBookService {
+  rpc Subscribe(SubscribeDepthRequest) returns (stream DepthUpdate);
+}
+
+message SubscribeDepthRequest {
+  // The delivery area to subscribe to, as its ENTSO-E EIC code (e.g. `10YFI-1--------U`).
+  // A guard, not a filter: each stream serves one area whole. The value must match a served
+  // area, or the request is rejected with NOT_FOUND — the client is pointed at the wrong
+  // connector.
+  string eic_code = 1;
+}
+
+// A batch of depth views: the full set on the connect/lag seed, or the books a single frame changed.
+message DepthUpdate {
+  repeated DepthView views = 1;
+  // Our receive timestamp (unix nanos) for the frame whose changed books this batch carries. The
+  // connect/lag seed is assembled from the current state of many frames, so it instead carries
+  // the receive time of the last frame applied to the area (0 until the first) — how fresh the
+  // seeded state is.
+  int64 received_at_nanos = 2;
+  // Per-delivery-area frame sequence assigned by the connector: increments with every LocalView
+  // frame applied to the area. A delta batch carries its frame's seq; the connect/lag seed
+  // carries the last applied frame's seq. The stream never delivers a delta with seq <= the
+  // seed's — those frames are already reflected in the seed and are dropped server-side — so
+  // every delta is strictly newer than the seed it follows.
+  int64 seq = 3;
+}
+
+message DepthView {
+  int64 contract_id = 1;
+  MarketType market_type = 2;
+  int64 revision = 3;
+  // Best-first (bids high→low, asks low→high), capped at the top N levels; empty when the
+  // side has no resting orders.
+  repeated Level bids = 4;
+  repeated Level asks = 5;
+}
+
+message Level {
+  int64 price = 1;
+  int64 total_quantity = 2;
+  uint32 order_count = 3;
+  // Unix nanos when this level was created in the connector's book: our receive time for the
+  // frame that opened it (a snapshot stamps every level it (re)creates with the snapshot's
+  // receive time, since we have no observation time for state that predates it).
+  int64 created_at_nanos = 4;
+  // Unix nanos when this level was last touched (a join, resize, or partial remove that left it
+  // non-empty): our receive time for that frame. Equal to created_at_nanos for a level no frame
+  // has changed since it opened.
+  int64 updated_at_nanos = 5;
+}

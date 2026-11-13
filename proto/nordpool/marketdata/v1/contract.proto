@@ -1,0 +1,86 @@
+// Vendored verbatim from the nordpool-connector repo (proto/nordpool/marketdata/v1/
+// contract.proto) — that repo is the single owner; do not edit here.
+
+syntax = "proto3";
+
+package nordpool.marketdata.v1;
+
+import "nordpool/marketdata/v1/types.proto";
+
+// Streams contract reference data filtered to the delivery areas the subscriber asks for. The
+// upstream contract feed is global; the connector keeps the contracts trading in at least one
+// of its configured areas — with their area states trimmed to those areas — and each
+// subscription narrows further to its requested areas. On connect a client receives the
+// current filtered set as the first message; after that it receives each contract frame's
+// changed batch (filtered the same way) as it arrives. Every message is a set of upserts keyed
+// by contract id (contracts are never removed, they change state), so a client just merges
+// each batch into its own map.
+service ContractService {
+  rpc SubscribeContracts(SubscribeContractsRequest) returns (stream ContractUpdate);
+}
+
+message SubscribeContractsRequest {
+  // The delivery areas to subscribe to, as ENTSO-E EIC codes (e.g. `10YFI-1--------U`) — a
+  // filter: only contracts trading in at least one of these areas are streamed. The filter
+  // selects whole contracts — a streamed contract carries its state for every area the
+  // connector is configured for, which may include areas outside this set. An area the
+  // connector is not configured for is not an error; it just never matches. An empty set is
+  // rejected with INVALID_ARGUMENT.
+  repeated string eic_codes = 1;
+}
+
+// A batch of contract upserts: the full set on the first message and on a re-sync, or just the
+// contracts a single feed frame changed.
+message ContractUpdate {
+  repeated Contract contracts = 1;
+  // Our receive timestamp (unix nanos) for the frame whose changed contracts this batch carries.
+  // The connect/lag seed is the full current set assembled from many frames, so it instead
+  // carries the receive time of the last contract frame applied to the set (0 until the first) —
+  // how fresh the seeded state is.
+  int64 received_at_nanos = 2;
+  // Frame sequence assigned by the connector: increments with every contract frame applied to
+  // the set. A delta batch carries its frame's seq; the connect/lag seed carries the last
+  // applied frame's seq. The stream never delivers a delta with seq <= the seed's — those
+  // frames are already reflected in the seed and are dropped server-side — so every delta is
+  // strictly newer than the seed. The stream may skip numbers: frames that changed nothing for
+  // the subscription are not sent.
+  int64 seq = 3;
+}
+
+message Contract {
+  int64 contract_id = 1;
+  string name = 2;
+  string market_id = 3;
+  MarketType market_type = 4;
+  ProductType product_type = 5;
+  int64 delivery_start_ms = 6;
+  int64 delivery_end_ms = 7;
+  int32 duration_seconds = 8;
+  int64 updated_at_ms = 9;
+  repeated ContractDeliveryArea delivery_areas = 10;
+}
+
+message ContractDeliveryArea {
+  // The delivery area, as its ENTSO-E EIC code.
+  string eic_code = 1;
+  ContractState state = 2;
+}
+
+// Mirrors the domain `ProductType`: the connector tracks the 15/30/60-minute periodic
+// products and folds every other shape (blocks, custom, unspecified) into OTHER. NONE is the
+// unset default, distinct from a contract that is OTHER.
+enum ProductType {
+  PRODUCT_TYPE_NONE = 0;
+  PRODUCT_TYPE_P15_MIN = 1;
+  PRODUCT_TYPE_P30_MIN = 2;
+  PRODUCT_TYPE_P60_MIN = 3;
+  PRODUCT_TYPE_OTHER = 4;
+}
+
+enum ContractState {
+  CONTRACT_STATE_NONE = 0;
+  CONTRACT_STATE_ACTIVE = 1;
+  CONTRACT_STATE_HIBERNATED = 2;
+  CONTRACT_STATE_INACTIVE = 3;
+  CONTRACT_STATE_FROZEN = 4;
+}

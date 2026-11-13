@@ -1,0 +1,266 @@
+syntax = "proto3";
+
+package flow.v1;
+
+// MarketType (the order book a contract trades on) is the shared definition in
+// types.proto — identical numeric values to nordpool.marketdata.v1.MarketType,
+// so the executor sees one market-type vocabulary across the connector's contract
+// feed, the Contract/Position services, and the gateway's orders/trades. PowerBot
+// encodes it as a contract-id prefix (NX_ = XBID, NI_ = local); the gateway splits
+// that prefix off into the market_type field and the bare integer contract_id.
+import "flow/v1/types.proto";
+
+// PowerbotOrderService is the executor's write path to PowerBot: gRPC order
+// actions that the gateway translates and forwards to PowerBot's REST API.
+// See docs/design.md ("gRPC API").
+service PowerbotOrderService {
+  // AddOrder places a single Immediate-Or-Cancel (IOC) order via
+  // POST /{exchange}/v2/api/orders. The returned OwnOrder relays PowerBot's
+  // synchronous response; per the PowerBot spec that response is advisory —
+  // the OwnOrders execution feed is the source of truth for resulting state.
+  rpc AddOrder(AddOrderRequest) returns (AddOrderResponse);
+}
+
+// PowerbotExecutionService is the executor's read path: gateway-relayed
+// PowerBot execution feeds. Each stream is seed-then-deltas — the first frame is
+// a snapshot of current state, then live batches as they decode off the
+// websocket, with a per-stream `seq` so the client drops the seed/delta overlap
+// — and ends with a terminal status on shutdown or when a slow subscriber is
+// dropped; the client's one rule is that any terminal status means "reconnect"
+// (which re-seeds). See docs/design.md. The seed is served from the gateway's
+// in-memory stores (future-delivery contracts); a boot-time fold from Postgres
+// to cover beyond PowerBot's retention is a later milestone.
+service PowerbotExecutionService {
+  // Own trade executions: the external `trades` of each websocket
+  // OwnTradeChanges batch, keyed by trade id for idempotent, never-regress
+  // merging on the client. On a *shadow* gateway (config `shadow = true`) this
+  // stream also carries the gateway's shadow executions — PowerBot reports those
+  // as internal trades, and the gateway normalizes each our-side leg into an
+  // ordinary Trade at ingest (trade_id = the internal id suffixed `-b`/`-s`;
+  // docs/design.md, "Shadow instances") — so consumers need no shadow-awareness:
+  // fills are fills.
+  rpc SubscribeOwnTrades(SubscribeOwnTradesRequest) returns (stream OwnTradesUpdate);
+  // Internal trades (a match between two of your own orders) are deliberately not
+  // exposed: the concept stops at the gateway boundary. On a *shadow* gateway
+  // each our-side leg is normalized onto SubscribeOwnTrades as an ordinary Trade
+  // (above); on a *live* gateway an internal trade is a self-match anomaly
+  // (unexpected under IOC-only order entry) — recorded durably and alarmed, never
+  // streamed. See docs/design.md, "Shadow instances".
+  // Own-order revisions: every OwnOrderChanges batch as it decodes off the
+  // websocket. Orders are keyed by order id for idempotent merging.
+  rpc SubscribeOwnOrders(SubscribeOwnOrdersRequest) returns (stream OwnOrdersUpdate);
+}
+
+enum OrderSide {
+  ORDER_SIDE_NONE = 0;
+  ORDER_SIDE_BUY = 1;
+  ORDER_SIDE_SELL = 2;
+}
+
+// OrderAction is the last action carried out for an order, mirroring PowerBot's
+// OwnOrder.action codes. The leading letter is the actor: U = user, A = market
+// operations on the user's behalf, S = the system, Q = quotes.
+enum OrderAction {
+  ORDER_ACTION_NONE = 0;
+  ORDER_ACTION_UADD = 1;   // Order added by the user.
+  ORDER_ACTION_UHIB = 2;   // Order deactivated by the user.
+  ORDER_ACTION_UMOD = 3;   // Order modified by the user.
+  ORDER_ACTION_UDEL = 4;   // Order deleted by the user.
+  ORDER_ACTION_UREJ = 5;   // Pre-arranged order rejected by the user.
+  ORDER_ACTION_AADD = 6;   // Order added by market operations on behalf.
+  ORDER_ACTION_AHIB = 7;   // Order deactivated by market operations on behalf.
+  ORDER_ACTION_AMOD = 8;   // Order modified by market operations on behalf.
+  ORDER_ACTION_ADEL = 9;   // Order deleted by market operations on behalf.
+  ORDER_ACTION_AREJ = 10;  // Pre-arranged order rejected by market operations on behalf.
+  ORDER_ACTION_SADD = 11;  // Order added by the system.
+  ORDER_ACTION_SHIB = 12;  // Order deactivated by the system.
+  ORDER_ACTION_SMOD = 13;  // Order modified by the system.
+  ORDER_ACTION_SDEL = 14;  // Order deleted by the system.
+  ORDER_ACTION_SREJ = 15;  // Pre-arranged order rejected by the system.
+  ORDER_ACTION_FEXE = 16;  // Order is fully executed.
+  ORDER_ACTION_PEXE = 17;  // Partial execution of order.
+  ORDER_ACTION_IADD = 18;  // A new slice of an iceberg order was added to the service.
+  ORDER_ACTION_SERR = 19;  // Validation failed on SOB side, or the SOB request timed out (remote orders).
+  ORDER_ACTION_SNAV = 20;  // Order state unknown due to SOB unavailability (remote orders).
+  ORDER_ACTION_QADD = 21;  // Quote was added.
+  // Quote was fully executed. PowerBot's schema (and generated client) spell the
+  // wire code AFEX; the API's prose description calls it QFEX — AFEX is what's sent.
+  ORDER_ACTION_AFEX = 22;
+  ORDER_ACTION_QPEX = 23;  // Quote was partially executed.
+  ORDER_ACTION_RLVI = 24;  // Order violates limits set at PowerBot.
+}
+
+// OrderState is an order's lifecycle state, mirroring PowerBot's OwnOrder.state
+// codes. ACTI and HIBE are the states a user sets; IACT and UNKW are reported by
+// the system.
+enum OrderState {
+  ORDER_STATE_NONE = 0;
+  ORDER_STATE_ACTI = 1;  // Entered and exposed to the market for execution (default).
+  ORDER_STATE_HIBE = 2;  // Entered into the backend but not exposed to the market.
+  ORDER_STATE_IACT = 3;  // Inactive.
+  ORDER_STATE_UNKW = 4;  // Unknown.
+}
+
+// TradeState is a trade's lifecycle state, mirroring PowerBot's Trade.state codes.
+enum TradeState {
+  TRADE_STATE_NONE = 0;
+  TRADE_STATE_CNCL = 1;  // Cancelled by market operations.
+  TRADE_STATE_RREJ = 2;  // Requested recall rejected by market operations.
+  TRADE_STATE_RGRA = 3;  // Requested recall granted by market operations.
+  TRADE_STATE_RREQ = 4;  // Recall of this trade was requested.
+  TRADE_STATE_ACTI = 5;  // Active (default).
+  TRADE_STATE_CREQ = 6;  // Cancel requested from local market operations.
+  TRADE_STATE_CREJ = 7;  // Cancel rejected by global market operations.
+  TRADE_STATE_RSFA = 8;  // Request sent for approval to SOB (XBID).
+}
+
+// AggressorIndicator marks whether an executed order was the trade aggressor or
+// the originator, per PowerBot's per-side Y/N/U codes.
+enum AggressorIndicator {
+  AGGRESSOR_INDICATOR_NONE = 0;
+  AGGRESSOR_INDICATOR_AGGRESSOR = 1;   // Y — trade aggressor.
+  AGGRESSOR_INDICATOR_ORIGINATOR = 2;  // N — trade originator.
+  AGGRESSOR_INDICATOR_UNKNOWN = 3;     // U — not provided by the exchange.
+}
+
+message SubscribeOwnTradesRequest {
+  // The portfolio scope of the subscription. Required, and it MUST name a
+  // portfolio this gateway serves; anything else — including empty — is
+  // rejected with INVALID_ARGUMENT. Every subscriber states its scope
+  // explicitly, so a caller whose portfolio expectation this gateway cannot
+  // meet fails fast at subscribe time instead of receiving a stream it
+  // misreads (for a position consumer, misattributed fills are position
+  // corruption). The seed and every delta are trimmed to trades of that
+  // portfolio (the leg that is ours — see Trade); a delta batch left empty by
+  // the trim is not sent at all. `seq` therefore skips over unsent batches,
+  // which is fine: it is an overlap dedupe (`seq > seed_seq`), not a gap
+  // detector.
+  string portfolio_id = 1;
+}
+
+message SubscribeOwnOrdersRequest {
+  // The portfolio scope of the subscription — required; see
+  // SubscribeOwnTradesRequest. An order is in scope when its portfolio_id
+  // matches.
+  string portfolio_id = 1;
+}
+
+// One live batch of external own-trade executions — the external `trades` of
+// one websocket OwnTradeChanges message.
+message OwnTradesUpdate {
+  // Gateway receive time (unix nanos) for the websocket batch these trades
+  // arrived in.
+  int64 received_at_nanos = 1;
+  // Monotonic external-trade store sequence this batch was applied at. The seed
+  // is the first frame; the client forwards only deltas with `seq > seed_seq`,
+  // dropping the seed/delta overlap.
+  uint64 seq = 2;
+  repeated Trade trades = 3;
+}
+
+// One live batch of own-order revisions — the orders in one websocket
+// OwnOrderChanges message.
+message OwnOrdersUpdate {
+  // Gateway receive time (unix nanos) for the websocket batch these orders
+  // arrived in.
+  int64 received_at_nanos = 1;
+  // Monotonic own-order store sequence this batch was applied at.
+  uint64 seq = 2;
+  repeated OwnOrder orders = 3;
+}
+
+// A trade, curated to our side of PowerBot's Trade: the per-counterparty order
+// identifiers are collapsed to the leg that is ours (order_id, cl_order_id,
+// portfolio_id, strategy_id), and `side` says which side of the trade we took.
+// Field order follows PowerBot's Trade schema.
+message Trade {
+  string trade_id = 1;
+  TradeState state = 2;           // ACTI, CNCL, RREQ, ...
+  string exchange = 3;            // exchange the trade executed on
+  // Delivery-area EIC of your side of the trade (sell area if you sold, else buy).
+  string delivery_area_eic = 4;
+  int64 api_timestamp_nanos = 5;  // when PowerBot received it (unix epoch nanos, UTC)
+  int64 exec_time_nanos = 6;      // when the exchange executed the trade (unix epoch nanos, UTC)
+  OrderSide side = 7;             // our side: BUY if we bought energy, else SELL
+  string order_id = 8;            // our order id (the leg matching our side)
+  string portfolio_id = 9;        // our portfolio id
+  int64 contract_id = 10;         // bare nordpool contract id (PowerBot prefix stripped)
+  MarketType market_type = 17;    // the stripped prefix: NX_ → XBID, NI_ → LOCAL
+  string contract_name = 11;
+  int64 price = 12;               // minor currency unit per MWh (currency/MWh ×100), may be negative
+  int64 quantity = 13;            // kilowatts (MW ×1000)
+  // Both legs ours. Should never occur under the gateway's IOC-only order entry
+  // (nothing of ours rests in the book to match against); relayed for audit with
+  // the buy leg's identifiers, and alarmed on gateway ingest.
+  bool self_trade = 14;
+  string strategy_id = 15;        // our strategy id
+  string unit_id = 16;            // our unit id (the leg matching our side)
+  // The client order id echoed from the order that produced our leg (buy_txt if
+  // we bought, else sell_txt) — the `cl_order_id` set on OrderEntry, which the
+  // gateway forwarded to PowerBot as `txt`; the order↔trade correlation key.
+  string cl_order_id = 18;
+}
+
+message AddOrderRequest {
+  // Exchange to route to, matching PowerBot's path segment: "nordpool",
+  // "epex", ... (see the Exchange enum in api/openapi.yaml).
+  string exchange = 1;
+  OrderEntry order = 2;
+}
+
+// OrderEntry is the order to place. The gateway fixes the execution restriction
+// to IOC (validity NON, type O = regular limit order), so those are not fields.
+message OrderEntry {
+  // Portfolio the order is entered on. Required.
+  string portfolio_id = 1;
+  // Delivery-area EIC. Required in multi-delivery-area configurations.
+  string delivery_area_eic = 2;
+  OrderSide side = 3;
+  // Quantity in kilowatts (kW) — the MW quantity scaled ×1000. Integer to avoid
+  // binary-float rounding on the wire, matching the nordpool-connectors feeds.
+  int64 quantity = 4;
+  // Limit price in the contract currency's minor unit per MWh (e.g. euro cents
+  // per MWh) — the currency/MWh price scaled ×100. May be negative. Integer for
+  // the same reason as quantity.
+  int64 price = 5;
+  // Nordpool contract id to trade and its market type. The gateway joins them
+  // into PowerBot's prefixed contract id (NX_<id> for XBID, NI_<id> for local).
+  // Both required.
+  int64 contract_id = 6;
+  MarketType market_type = 8;
+  // Client order id (nonce): a correlation label the gateway forwards to PowerBot
+  // as `txt`, echoed back on the resulting trade's cl_order_id. Optional.
+  string cl_order_id = 7;
+}
+
+message AddOrderResponse {
+  OwnOrder order = 1;
+}
+
+// OwnOrder mirrors the subset of PowerBot's OwnOrder we relay on the order
+// response. Fields absent in PowerBot's response are left at proto defaults.
+message OwnOrder {
+  string order_id = 1;
+  int64 revision_no = 2;
+  // Order lifecycle state (ACTI, HIBE, IACT, UNKW).
+  OrderState state = 3;
+  // Last action carried out for the order (UADD, FEXE, PEXE, UDEL, ...).
+  OrderAction action = 4;
+  OrderSide side = 5;
+  int64 contract_id = 6;   // bare nordpool contract id (PowerBot prefix stripped)
+  MarketType market_type = 14; // the stripped prefix: NX_ → XBID, NI_ → LOCAL
+  string delivery_area_eic = 7;
+  string portfolio_id = 8;
+  int64 price = 9;     // minor currency unit per MWh (currency/MWh ×100), may be negative
+  int64 quantity = 10; // kilowatts (MW ×1000)
+  string cl_order_id = 11;
+  // When the last update was received from the exchange (unix epoch nanos, UTC), 0 if unset.
+  int64 api_timestamp_nanos = 12;
+  // Errors associated with this order (set on entry/modification responses).
+  repeated OrderError errors = 13;
+}
+
+message OrderError {
+  string code = 1;
+  string message = 2;
+}

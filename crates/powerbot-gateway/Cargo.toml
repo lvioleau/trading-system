@@ -1,0 +1,60 @@
+[package]
+name = "powerbot-gateway"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+# Parse PowerBot's RFC3339 timestamps to epoch millis (and back for order entry);
+# no clock feature needed — we never read the wall clock here.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# INI config with ${VAR} substitution, same as the sibling nordpool-connectors.
+configparser = "3"
+ctrlc = { version = "3", features = ["termination"] }
+flow-util = { path = "../flow-util" }
+# DogStatsD metrics under `powerbot.*` (docs/design.md, "Observability"), same
+# stack as the sibling nordpool-connectors: the `metrics` facade emits, the
+# exporter aggregates client-side and flushes over UDP from a background thread.
+metrics = "0.24"
+metrics-exporter-dogstatsd = "0.9"
+powerbot-models = { path = "../powerbot-models" }
+rustls = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+stomp-parser = "0.8"
+thiserror = "2"
+tracing = "0.1"
+# JSON-to-stdout logging through a non-blocking writer (the driver logs on its
+# hot path; a stalled stdout must never freeze it), mirroring nordpool-connectors.
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+url = "2"
+webpki-roots = "0.26"
+
+# Order entry: async REST client to PowerBot + tonic gRPC server for the executor.
+# rustls throughout (no OpenSSL), matching the websocket transport.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+# Only for StreamExt::take_until (tokio-stream has no future-bounded cut);
+# already in the tree via tonic/hyper. Mirrors nordpool-stream-server.
+futures-util = { version = "0.3", default-features = false }
+tonic = "0.12"
+tonic-health = "0.12"
+tonic-reflection = "0.12"
+prost = "0.13"
+
+# Durable execution record in Postgres — schema `execution` in the shared
+# `trading` DB, sqlx like trading-system/contract-service. No TLS feature yet
+# (dev Postgres is plain; prod RDS TLS is a later knob), keeping OpenSSL out.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "migrate", "macros"] }
+
+[dev-dependencies]
+rcgen = "0.13"
+
+[build-dependencies]
+tonic-build = "0.12"
+# Fallback protoc for environments without one on PATH (e.g. GitHub CI, which
+# doesn't use the Nix/devenv shell). Locally the devenv shell supplies protoc.
+protoc-bin-vendored = "3"
